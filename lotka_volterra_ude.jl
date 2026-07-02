@@ -267,8 +267,10 @@ y₂ = reshape(Float64.([y[2] for y in targets]), :, 1)
 
 # LASSO ( min ‖Φβ − y‖₂² + λ‖β‖₁ ) via coordinate descent with soft-thresholding.
 # The L1 penalty drives all but the genuinely-active basis terms to zero, so the
-# regression selects a sparse, interpretable equation.
-λ = 0.1
+# regression SELECTS a sparse, interpretable set of terms.
+λ = 0.1          # LASSO strength (controls selection)
+threshold = 0.1  # a basis term counts as "active" if |coefficient| exceeds this
+
 function lasso_cd(Φ, y; λ = 0.1, iters = 50_000, tol = 1e-12)
     m = size(Φ, 2)
     β = zeros(m)
@@ -293,11 +295,20 @@ function lasso_cd(Φ, y; λ = 0.1, iters = 50_000, tol = 1e-12)
     return reshape(β, :, 1)
 end
 
-β₁ = lasso_cd(Φ, vec(y₁); λ = λ)
-β₂ = lasso_cd(Φ, vec(y₂); λ = λ)
+# Relaxed LASSO: use the L1 fit only to SELECT the active terms, then refit their
+# magnitudes by ordinary least squares. LASSO is excellent at selection but biases
+# coefficients toward zero, so this debiasing step recovers their true size.
+function debias(β, Φ, y; threshold = 0.1)
+    active = findall(c -> abs(c) > threshold, vec(β))
+    βr = zeros(size(Φ, 2))
+    isempty(active) || (βr[active] = Φ[:, active] \ vec(y))
+    return reshape(βr, :, 1)
+end
 
-# Threshold tiny coefficients and pretty-print the surviving terms.
-threshold = 0.1
+β₁ = debias(lasso_cd(Φ, vec(y₁); λ = λ), Φ, y₁; threshold = threshold)
+β₂ = debias(lasso_cd(Φ, vec(y₂); λ = λ), Φ, y₂; threshold = threshold)
+
+# Pretty-print the surviving terms.
 function format_expr(β, φs, threshold)
     terms = String[]
     for (coeff, term) in zip(β, φs)

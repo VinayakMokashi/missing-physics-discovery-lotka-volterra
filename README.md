@@ -57,9 +57,10 @@ split into seven labelled sections:
    with `Zygote` reverse-mode AD through the ODE solve.
 5. **Analysis** — trained trajectory vs. ground truth, the network's recovered
    interaction term vs. the true one, and the reconstruction error.
-6. **Sparse symbolic regression** — build a polynomial candidate library, then
-   solve a LASSO (`min ‖Φβ − y‖² + λ‖β‖₁`) so that only the genuinely-active
-   basis terms survive, yielding an interpretable equation.
+6. **Sparse symbolic regression** — build a polynomial candidate library and run
+   a *relaxed* LASSO: an L1 fit (`min ‖Φβ − y‖² + λ‖β‖₁`) selects the handful of
+   active terms, then ordinary least squares refits their magnitudes (debiasing
+   the L1 shrinkage) to give an interpretable equation with accurate coefficients.
 7. **Rebuild & compare** — plug the recovered coefficients back into the
    mechanistic ODE and compare against the true system.
 
@@ -136,20 +137,18 @@ Everything is written **next to the script**, so the repo stays self-contained.
 ## Result
 
 Out of the 15 candidate terms, the sparse regression keeps **only** the `x·y`
-interaction — every other coefficient is thresholded to zero — recovering the
-exact functional form of the missing physics:
+interaction — every other coefficient is driven to zero — recovering both the
+exact functional form **and** the magnitude of the missing physics:
 
 ```
-y1(t) ~ -0.834 * u1*u2      (true term: -0.9 * x*y)
-y2(t) ~  0.701 * u1*u2      (true term: +0.8 * x*y)
+y1(t) ~ -0.899 * u1*u2      (true term: -0.9 * x*y)
+y2(t) ~  0.800 * u1*u2      (true term: +0.8 * x*y)
 ```
 
-The **structure is recovered perfectly**; the magnitudes sit slightly below the
-true values because the L1 (LASSO) penalty shrinks coefficients toward zero —
-expected behaviour. Rebuilding the mechanistic Lotka–Volterra model from the
-recovered coefficients reproduces the predator–prey oscillation with only a
-modest offset from that shrinkage (`07_actual_vs_learned.png`): the missing
-physics has been rediscovered from noisy data.
+Rebuilding the mechanistic Lotka–Volterra model from these recovered coefficients
+reproduces the true predator–prey oscillation almost exactly
+(`07_actual_vs_learned.png`): the missing physics has been rediscovered from
+noisy data.
 
 ---
 
