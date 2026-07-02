@@ -4,7 +4,6 @@ Thumbs.db
 *~
 .vscode/
 .idea/
-.claude/
 
 # Julia coverage / profiling artifacts
 *.jl.cov
