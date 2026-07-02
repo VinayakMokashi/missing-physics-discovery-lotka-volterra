@@ -10,8 +10,6 @@ interaction terms with a neural network. After training, **sparse symbolic
 regression** distills that neural network back into a clean algebraic expression,
 recovering the original Lotka–Volterra interaction terms.
 
-> Julia port of `SciML Mini Project.ipynb`, packaged as a runnable script.
-
 ---
 
 ## The problem
@@ -19,8 +17,8 @@ recovering the original Lotka–Volterra interaction terms.
 The ground-truth system is the classic Lotka–Volterra model:
 
 ```
-dx/dt =  α·x  −  β·x·y        (prey / resource)
-dy/dt =  γ·x·y  −  δ·y        (predator / consumer)
+dx/dt =  α·x  −  β·x·y        (prey)
+dy/dt =  γ·x·y  −  δ·y        (predator)
 ```
 
 with true parameters `α = 1.3, β = 0.9, γ = 0.8, δ = 1.8`.
@@ -35,30 +33,58 @@ the nonlinear interaction terms (`−β·x·y` and `+γ·x·y`) from noisy obser
 | 1 | Generate noisy data from the true ODE | `OrdinaryDiffEq` |
 | 2 | Build a UDE — known linear terms + a neural net `U(x,y)` for the unknown terms | `Lux`, `ComponentArrays` |
 | 3 | Train `U` to fit the data: **ADAM** warm-up → **L-BFGS** polish | `Optimization`, `SciMLSensitivity`, `Zygote` |
-| 4 | Sparse **symbolic regression** (LASSO over a polynomial basis) recovers the equation | pure-Julia `LinearAlgebra` (notebook used `Convex`/`SCS`) |
+| 4 | Sparse **symbolic regression** (LASSO over a polynomial basis) recovers the equation | `LinearAlgebra`, `ModelingToolkit` |
 | 5 | Plug recovered coefficients into the mechanistic ODE and compare to truth | `OrdinaryDiffEq`, `Plots` |
 
-The neural network uses a radial-basis (`exp(-x²)`) activation, which pairs well
-with the smooth polynomial structure the interaction terms actually have.
+The neural network uses a radial-basis (`exp(-x²)`) activation, which suits the
+smooth structure of the interaction terms we are trying to recover.
+
+---
+
+## How the code is organized
+
+Everything lives in a single, linear script, [`lotka_volterra_ude.jl`](lotka_volterra_ude.jl),
+split into seven labelled sections:
+
+1. **Ground-truth model & noisy data** — integrate the true Lotka–Volterra ODE
+   and add mean-scaled Gaussian noise to create the training set.
+2. **Neural network** — a 4-layer MLP with radial-basis activations that will
+   stand in for the unknown interaction terms.
+3. **Hybrid UDE, prediction & loss** — the right-hand side keeps the known linear
+   terms and adds the network; `predict` integrates it (with adjoint
+   sensitivities), and `loss` is the MSE against the noisy data.
+4. **Training** — ADAM warm-up followed by an L-BFGS polish, via `Optimization.jl`
+   with `Zygote` reverse-mode AD through the ODE solve.
+5. **Analysis** — trained trajectory vs. ground truth, the network's recovered
+   interaction term vs. the true one, and the reconstruction error.
+6. **Sparse symbolic regression** — build a polynomial candidate library, then
+   solve a LASSO (`min ‖Φβ − y‖² + λ‖β‖₁`) so that only the genuinely-active
+   basis terms survive, yielding an interpretable equation.
+7. **Rebuild & compare** — plug the recovered coefficients back into the
+   mechanistic ODE and compare against the true system.
+
+The LASSO in step 6 is solved with a small self-contained coordinate-descent
+routine (no external convex-optimization dependency). An equivalent `Convex.jl` +
+`SCS` formulation of the *same* objective is included, commented, for reference;
+the two agree to solver tolerance.
 
 ---
 
 ## Quick start
 
-The script runs end to end on both a modern Julia and the older pinned SciML
-environment — the sparse-regression step uses a small pure-Julia LASSO solver,
-so **no extra packages are needed**. Pick whichever environment you have.
+The script is self-contained — the sparse-regression step needs no packages
+beyond the core SciML stack — so it runs end to end on either environment below.
 
 ### Option A — the pinned bootcamp environment (Julia 1.6.7)
 
-If you already have the SciML `bootcamp` environment, just point Julia at it:
+If you already have the SciML `bootcamp` environment, point Julia at it:
 
 ```bash
 julia --project="d:/SciML/bootcamp" "lotka_volterra_ude.jl"
 ```
 
-Verified end to end on this setup (Julia 1.6.7): training + all seven figures +
-all result files, in a few minutes.
+Verified end to end on this setup: training, all seven figures, and every result
+file, in a few minutes.
 
 ### Option B — standalone, modern Julia (1.10+)
 
@@ -74,16 +100,8 @@ julia --project=. lotka_volterra_ude.jl
 
 After instantiating, commit the generated `Manifest.toml` to pin exact versions.
 
-> **Note on the LASSO solver.** The notebook solved the sparse regression with
-> `Convex.jl` + `SCS`. That code is preserved (commented) in cell 21, but the
-> active solver is a tiny pure-Julia coordinate descent minimising the *identical*
-> objective, `min ‖Φβ − y‖² + λ‖β‖₁`. It was verified head-to-head against
-> `Convex`/`SCS` on this exact problem — same sparsity pattern, coefficients
-> agreeing to ~3e-3 (SCS's own tolerance). This is what lets the whole pipeline
-> run on Julia 1.6.7, where loading `Convex` on the full SciML stack hangs.
-
 > **Runtime:** training runs 5000 ADAM iterations followed by up to 5000 L-BFGS
-> iterations, so expect a few minutes of compute on a laptop (on top of the
+> iterations, so expect a few minutes of compute on a laptop (on top of any
 > one-time package precompile). Progress prints every 50 iterations.
 
 You can also run it interactively — `include("lotka_volterra_ude.jl")` from a
@@ -101,10 +119,10 @@ Everything is written **next to the script**, so the repo stays self-contained.
 | `01_noisy_data.png` | Ground-truth trajectory + noisy training data |
 | `02_training_losses.png` | Loss curve (ADAM vs. L-BFGS) |
 | `03_ude_trajectory.png` | Trained UDE trajectory vs. ground truth |
-| `04_missing_term_reconstruction.png` | NN-recovered interaction term vs. the true one |
+| `04_missing_term_reconstruction.png` | Network-recovered interaction term vs. the true one |
 | `05_reconstruction_and_error.png` | Reconstruction + L2 error over time |
 | `06_overall.png` | Combined overview panel |
-| `07_actual_vs_learned.png` | Final mechanistic model (recovered coefficients) vs. truth |
+| `07_actual_vs_learned.png` | Mechanistic model from the recovered coefficients vs. truth |
 
 ### `results/`
 | File | Contents |
@@ -115,7 +133,7 @@ Everything is written **next to the script**, so the repo stays self-contained.
 | `sindy_coefficients.csv` | LASSO coefficients (`β₁`, `β₂`) for every basis term |
 | `learned_equations.txt` | The recovered symbolic equations |
 
-## Expected result
+## Result
 
 Out of the 15 candidate terms, the sparse regression keeps **only** the `x·y`
 interaction — every other coefficient is thresholded to zero — recovering the
@@ -126,11 +144,12 @@ y1(t) ~ -0.834 * u1*u2      (true term: -0.9 * x*y)
 y2(t) ~  0.701 * u1*u2      (true term: +0.8 * x*y)
 ```
 
-The magnitudes are pulled slightly toward zero by the L1 (LASSO) penalty — that
-shrinkage is expected — but the **structure** is recovered perfectly. Rebuilding
-the mechanistic Lotka–Volterra model from the recovered coefficients reproduces
-the true trajectory closely (`07_actual_vs_learned.png`): the missing physics has
-been rediscovered from noisy data.
+The **structure is recovered perfectly**; the magnitudes sit slightly below the
+true values because the L1 (LASSO) penalty shrinks coefficients toward zero —
+expected behaviour. Rebuilding the mechanistic Lotka–Volterra model from the
+recovered coefficients reproduces the predator–prey oscillation with only a
+modest offset from that shrinkage (`07_actual_vs_learned.png`): the missing
+physics has been rediscovered from noisy data.
 
 ---
 
@@ -138,38 +157,14 @@ been rediscovered from noisy data.
 
 ```
 .
-├── lotka_volterra_ude.jl     # the whole pipeline (start here)
-├── SciML Mini Project.ipynb  # original notebook this was ported from
-├── Project.toml              # dependencies for a reproducible environment
-├── figures/                  # generated PNGs (committed as evidence)
-├── results/                  # generated CSV/txt artefacts (committed as evidence)
+├── lotka_volterra_ude.jl   # the whole pipeline (start here)
+├── Project.toml            # dependencies for a reproducible environment
+├── figures/                # generated PNGs (committed as evidence)
+├── results/                # generated CSV/txt artefacts (committed as evidence)
 ├── README.md
-├── LICENSE                   # MIT
+├── LICENSE                 # MIT
 └── .gitignore
 ```
-
-## How the code maps to the notebook
-
-The script preserves the notebook's code cell-for-cell (each section is labelled
-`CELL N`), with one deliberate change: **cells 12 and 13 are swapped**, because
-the notebook's cell 12 depends on `X̂` / `ts` that are first defined in cell 13.
-In a linear script the definitions have to come first. Figure- and result-saving
-calls were added; the numerical logic is otherwise identical.
-
----
-
-## Publishing to GitHub
-
-From inside this folder:
-
-```bash
-git init
-git add .
-git commit -m "Lotka–Volterra UDE + symbolic regression"
-gh repo create lotka-volterra-ude --public --source=. --push
-```
-
-(or create the repo on github.com and `git remote add origin … && git push -u origin main`).
 
 ## License
 

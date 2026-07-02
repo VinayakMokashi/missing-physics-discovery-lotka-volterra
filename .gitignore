@@ -4,8 +4,6 @@ Thumbs.db
 *~
 .vscode/
 .idea/
-
-# Claude Code tooling state (not part of the project)
 .claude/
 
 # Julia coverage / profiling artifacts
@@ -13,9 +11,6 @@ Thumbs.db
 *.jl.*.cov
 *.jl.mem
 /docs/build/
-
-# Jupyter checkpoint clutter
-.ipynb_checkpoints/
 
 # NOTE: figures/ and results/ ARE tracked on purpose — they are the committed
 # visual + quantitative evidence produced by lotka_volterra_ude.jl.

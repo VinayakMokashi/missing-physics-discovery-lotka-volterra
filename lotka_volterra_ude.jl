@@ -1,60 +1,51 @@
 # =============================================================================
 #  Universal Differential Equations (UDE) + Symbolic Regression
-#  Rediscovering the Lotka–Volterra predator–prey dynamics from noisy data
+#  Rediscovering Lotka–Volterra predator–prey dynamics from noisy data
 # -----------------------------------------------------------------------------
-#  Julia port of "SciML Mini Project.ipynb".
+#  A hybrid scientific-machine-learning pipeline:
 #
-#  Pipeline
-#    1.  Generate noisy data from the true Lotka–Volterra ODE
-#    2.  Fit a Universal ODE: keep the known linear growth/decay terms and
-#        replace the unknown interaction terms with a neural network
-#    3.  Train the network (ADAM warm-up  ->  L-BFGS polish)
-#    4.  Recover the missing interaction terms with sparse symbolic regression
-#        (LASSO over a polynomial basis; a small pure-Julia coordinate-descent
-#         solver that matches the notebook's Convex.jl + SCS result — see CELL 21)
-#    5.  Plug the recovered coefficients back into the mechanistic ODE and
-#        compare against the ground truth
+#    1. Generate noisy observations from the true Lotka–Volterra ODE.
+#    2. Build a Universal ODE — keep the known linear growth/decay terms and
+#       let a neural network stand in for the unknown interaction terms.
+#    3. Train the network to fit the data (ADAM warm-up -> L-BFGS polish).
+#    4. Recover the missing interaction terms as a sparse symbolic equation
+#       (LASSO over a polynomial candidate library).
+#    5. Rebuild the mechanistic ODE from the recovered coefficients and
+#       compare it against the ground truth.
 #
-#  Outputs (written next to this script):
+#  Everything is written next to this script:
 #     ./figures   —  all PNG figures
-#     ./results   —  losses, trained parameters, recovered equations & data
+#     ./results   —  loss history, trained parameters, recovered equations, data
 #
-#  How to run  (see README.md for the full guide):
+#  Run:
 #     julia --project="d:/SciML/bootcamp" "lotka_volterra_ude.jl"
+#  (see README.md for environment details and a full walkthrough)
 # =============================================================================
 
-# --- Headless plotting when run as a script (`julia file.jl`) ----------------
-# Lets the GR backend save PNGs without opening a window. Interactive REPL use
-# (`include("lotka_volterra_ude.jl")`) is left untouched so plots still display.
+# Headless plotting: let the GR backend save PNGs without opening a window when
+# run as a script. Interactive REPL use (`include(...)`) still shows the plots.
 if !isinteractive()
     ENV["GKSwstype"] = "100"
 end
 
-# --- No extra package installs needed -----------------------------------------
-# The sparse-regression step (CELL 21) uses a tiny pure-Julia LASSO solver, so
-# this script runs against the base bootcamp environment as-is — nothing to add.
-# (The notebook's original Convex.jl + SCS solver is preserved, commented, in
-# CELL 21 for anyone on Julia 1.10+; that path needs `Pkg.add(["Convex","SCS"])`.)
-
 # =============================================================================
-#  CELL 0 — Packages & a reproducible RNG
+#  Packages & a reproducible RNG
 # =============================================================================
-# SciML Tools
+# SciML tools
 using OrdinaryDiffEq, ModelingToolkit, DataDrivenDiffEq, SciMLSensitivity, DataDrivenSparse
 using Optimization, OptimizationOptimisers, OptimizationOptimJL, LineSearches
 
-# Standard Libraries
-using LinearAlgebra, Statistics
+# Standard libraries
+using LinearAlgebra, Statistics, Printf
 
-# External Libraries
+# External libraries
 using ComponentArrays, Lux, Zygote, Plots, StableRNGs
 gr()
 
-# Set a random seed for reproducible behaviour
+# One fixed seed so every run (data noise + network init) is reproducible.
 rng = StableRNG(1111)
 
-# Output folders live next to this script, so everything is saved "in the same
-# folder" and the repo stays self-contained.
+# Output folders live next to this script, so the project stays self-contained.
 const FIG_DIR = joinpath(@__DIR__, "figures")
 const RES_DIR = joinpath(@__DIR__, "results")
 mkpath(FIG_DIR)
@@ -63,7 +54,7 @@ println("Figures -> ", FIG_DIR)
 println("Results -> ", RES_DIR)
 
 # =============================================================================
-#  CELL 1 — Ground-truth Lotka–Volterra model & noisy training data
+#  1. Ground-truth Lotka–Volterra model & noisy training data
 # =============================================================================
 function lotka!(du, u, p, t)
     α, β, γ, δ = p
@@ -71,7 +62,7 @@ function lotka!(du, u, p, t)
     du[2] = γ * u[1] * u[2] - δ * u[2]
 end
 
-# Define the experimental parameter
+# Experimental setup: time span, initial condition, true parameters.
 tspan = (0.0, 5.0)
 u0 = 5.0f0 * rand(rng, 2)
 p_ = [1.3, 0.9, 0.8, 1.8]
@@ -79,20 +70,19 @@ p_ = [1.3, 0.9, 0.8, 1.8]
 prob = ODEProblem(lotka!, u0, tspan, p_)
 solution = solve(prob, Tsit5(), abstol = 1e-12, reltol = 1e-12, saveat = 0.25)
 
-# Add noise in terms of the mean
+# Corrupt the clean solution with mean-scaled Gaussian noise.
 X = Array(solution)
 t = solution.t
 
 x̄ = mean(X, dims = 2)
 noise_magnitude = 5e-3
-
 Xₙ = X .+ (noise_magnitude * x̄) .* randn(rng, eltype(X), size(X))
 
 fig_data = plot(solution, alpha = 0.75, color = :black, label = ["True Data" nothing])
 scatter!(t, transpose(Xₙ), color = :red, label = ["Noisy Data" nothing])
 savefig(fig_data, joinpath(FIG_DIR, "01_noisy_data.png"))
 
-# Persist the exact dataset the model is trained on (reproducibility).
+# Persist the exact dataset the model is trained on.
 open(joinpath(RES_DIR, "data_noisy.csv"), "w") do io
     println(io, "t,x_noisy,y_noisy")
     for i in eachindex(t)
@@ -100,39 +90,35 @@ open(joinpath(RES_DIR, "data_noisy.csv"), "w") do io
     end
 end
 
-# --- CELL 2 — inspect the (random) initial condition --------------------------
 @show u0
 
 # =============================================================================
-#  CELL 3 — Neural network for the unknown interaction terms
+#  2. Neural network for the unknown interaction terms
 # =============================================================================
 rbf(x) = exp.(-(x .^ 2))
 
-# Multilayer FeedForward
+# A small multilayer perceptron with radial-basis activations, which suit the
+# smooth structure of the interaction terms we are trying to recover.
 const U = Lux.Chain(Lux.Dense(2, 5, rbf), Lux.Dense(5, 5, rbf), Lux.Dense(5, 5, rbf),
     Lux.Dense(5, 2))
-# Get the initial parameters and state variables of the model
 p, st = Lux.setup(rng, U)
 const _st = st
 
 # =============================================================================
-#  CELL 4 — Hybrid UDE dynamics (known physics + neural closure)
+#  3. Hybrid UDE dynamics, forward prediction & loss
 # =============================================================================
-# Define the hybrid model
+# Known physics (linear growth/decay) + a neural closure for the missing terms.
 function ude_dynamics!(du, u, p, t, p_true)
-    û = U(u, p, _st)[1] # Network prediction
+    û = U(u, p, _st)[1]                 # network prediction of the interaction
     du[1] = p_true[1] * u[1] + û[1]
     du[2] = -p_true[4] * u[2] + û[2]
 end
 
-# Closure with the known parameter
+# Close over the known parameters.
 nn_dynamics!(du, u, p, t) = ude_dynamics!(du, u, p, t, p_)
-# Define the problem
 prob_nn = ODEProblem(nn_dynamics!, Xₙ[:, 1], tspan, p)
 
-# =============================================================================
-#  CELL 5 — Forward prediction of the UDE
-# =============================================================================
+# Solve the UDE forward for a given parameter vector.
 function predict(θ, X = Xₙ[:, 1], T = t)
     _prob = remake(prob_nn, u0 = X, tspan = (T[1], T[end]), p = θ)
     Array(solve(_prob, Vern7(), saveat = T,
@@ -140,16 +126,14 @@ function predict(θ, X = Xₙ[:, 1], T = t)
         sensealg = QuadratureAdjoint(autojacvec = ReverseDiffVJP(true))))
 end
 
-# =============================================================================
-#  CELL 6 — Loss (mean squared error against the noisy data)
-# =============================================================================
+# Mean-squared error against the noisy observations.
 function loss(θ)
     X̂ = predict(θ)
     mean(abs2, Xₙ .- X̂)
 end
 
 # =============================================================================
-#  CELL 7 — Training callback (records the loss history)
+#  4. Train the network (ADAM warm-up -> L-BFGS polish)
 # =============================================================================
 losses = Float64[]
 
@@ -161,32 +145,21 @@ callback = function (state, l)
     return false
 end
 
-# =============================================================================
-#  CELL 8 — Optimization problem (Zygote reverse-mode AD)
-# =============================================================================
 adtype = Optimization.AutoZygote()
 optf = Optimization.OptimizationFunction((x, p) -> loss(x), adtype)
 optprob = Optimization.OptimizationProblem(optf, ComponentVector{Float64}(p))
 
-# =============================================================================
-#  CELL 9 — Stage 1 training: ADAM (fast, robust warm-up)
-# =============================================================================
-# NOTE: the notebook wrote `Adam(eta = 1e-3)`. The `eta` keyword only exists in
-# newer Optimisers.jl; the pinned bootcamp environment wants the positional
-# learning rate `Adam(1e-3)` (identical 1e-3 step size).
+# Stage 1 — ADAM: fast, robust warm-up.
 res1 = Optimization.solve(
     optprob, OptimizationOptimisers.Adam(1e-3), callback = callback, maxiters = 5000)
 println("Training loss after $(length(losses)) iterations: $(losses[end])")
 
-# =============================================================================
-#  CELL 10 — Stage 2 training: L-BFGS (high-accuracy polish)
-# =============================================================================
+# Stage 2 — L-BFGS: high-accuracy polish from the ADAM solution.
 optprob2 = Optimization.OptimizationProblem(optf, res1.u)
 res2 = Optimization.solve(
     optprob2, LBFGS(linesearch = BackTracking()), callback = callback, maxiters = 5000)
 println("Final training loss after $(length(losses)) iterations: $(losses[end])")
 
-# Rename the best candidate
 p_trained = res2.u
 
 # Persist the loss curve and the trained parameters.
@@ -203,10 +176,7 @@ open(joinpath(RES_DIR, "trained_parameters.csv"), "w") do io
     end
 end
 
-# =============================================================================
-#  CELL 11 — Training-loss curve (ADAM vs L-BFGS)
-# =============================================================================
-# Plot the losses
+# Training-loss curve (ADAM vs L-BFGS).
 pl_losses = plot(1:5000, losses[1:5000], yaxis = :log10, xaxis = :log10,
     xlabel = "Iterations", ylabel = "Loss", label = "ADAM", color = :blue)
 plot!(5001:length(losses), losses[5001:end], yaxis = :log10, xaxis = :log10,
@@ -214,58 +184,38 @@ plot!(5001:length(losses), losses[5001:end], yaxis = :log10, xaxis = :log10,
 savefig(pl_losses, joinpath(FIG_DIR, "02_training_losses.png"))
 
 # =============================================================================
-#  CELL 13 — Trained trajectory vs. ground truth
-# -----------------------------------------------------------------------------
-#  NOTE: in the notebook this cell (13) is executed BEFORE cell 12, because
-#  cell 12 relies on `X̂` and `ts` defined here. The order is swapped in this
-#  script so the dependencies resolve top-to-bottom.
+#  5. Analyse the trained model
 # =============================================================================
-## Analysis of the trained network
-# Plot the data and the approximation
+# Trained trajectory on a finer time grid vs. the ground truth.
 ts = first(solution.t):(mean(diff(solution.t)) / 2):last(solution.t)
 X̂ = predict(p_trained, Xₙ[:, 1], ts)
-# Trained on noisy data vs real solution
 pl_trajectory = plot(ts, transpose(X̂), xlabel = "t", ylabel = "x(t), y(t)", color = :red,
     label = ["UDE Approximation" nothing])
 scatter!(solution.t, transpose(Xₙ), color = :black, label = ["Ground truth" nothing])
 savefig(pl_trajectory, joinpath(FIG_DIR, "03_ude_trajectory.png"))
 
-# =============================================================================
-#  CELL 12 — Recovered vs. true missing interaction term
-# =============================================================================
-# Ideal unknown interactions of the predictor
-Ȳ = [-p_[2] * (X̂[1, :] .* X̂[2, :])'; p_[3] * (X̂[1, :] .* X̂[2, :])']
-# Neural network guess
-Ŷ = U(X̂, p_trained, st)[1]
-
+# What the network learned vs. the true missing interaction term.
+Ȳ = [-p_[2] * (X̂[1, :] .* X̂[2, :])'; p_[3] * (X̂[1, :] .* X̂[2, :])']   # true interaction
+Ŷ = U(X̂, p_trained, st)[1]                                             # network guess
 pl_reconstruction = plot(ts, transpose(Ŷ), xlabel = "t", ylabel = "U(x,y)", color = :red,
     label = ["UDE Approximation" nothing])
 plot!(ts, transpose(Ȳ), color = :black, label = ["True Interaction" nothing])
 savefig(pl_reconstruction, joinpath(FIG_DIR, "04_missing_term_reconstruction.png"))
 
-# =============================================================================
-#  CELL 14 — Reconstruction error & combined overview
-# =============================================================================
-# Plot the error
+# Reconstruction error over time, plus combined overview panels.
 pl_reconstruction_error = plot(ts, norm.(eachcol(Ȳ - Ŷ)), yaxis = :log, xlabel = "t",
     ylabel = "L2-Error", label = nothing, color = :red)
 pl_missing = plot(pl_reconstruction, pl_reconstruction_error, layout = (2, 1))
-
 pl_overall = plot(pl_trajectory, pl_missing)
 savefig(pl_missing, joinpath(FIG_DIR, "05_reconstruction_and_error.png"))
 savefig(pl_overall, joinpath(FIG_DIR, "06_overall.png"))
 
 # =============================================================================
-#  CELL 15 — Candidate library (as callable functions) for symbolic regression
+#  6. Sparse symbolic regression — recover the interaction as an equation
 # =============================================================================
-# The notebook wrote `using Symbolics, LinearAlgebra` here. Both are already
-# available: LinearAlgebra was loaded in CELL 0, and `@variables` (plus the whole
-# Symbolics symbolic-expression machinery) is re-exported by ModelingToolkit,
-# also loaded in CELL 0. We rely on that re-export — as the bootcamp's
-# HH-SciML-Project does (`using ModelingToolkit: @variables`) — because a late,
-# separate `using Symbolics` triggers a very slow recompilation cascade on the
-# pinned Julia 1.6.7 stack.
-
+# Polynomial candidate library, both as callable functions (to build the design
+# matrix) and as symbolic expressions (to pretty-print the result). `@variables`
+# is provided by ModelingToolkit, loaded above.
 @variables u1 u2
 basis_funcs = [
     u -> 1.0,
@@ -285,11 +235,7 @@ basis_funcs = [
     u -> u[2]^4
 ]
 
-# =============================================================================
-#  CELL 16 — Same library as symbolic expressions (for pretty-printing)
-# =============================================================================
 @variables u₁,u₂
-
 basis_symbols = [
     1,
     u₁,
@@ -308,52 +254,21 @@ basis_symbols = [
     u₂^4
 ]
 
-# =============================================================================
-#  CELL 17 — Assemble regression inputs (NN inputs) and targets (NN outputs)
-# =============================================================================
-# Step 1: Use existing X̂ (inputs) and Ŷ (predictions)
-X̂ = Array(X̂)  # size (2, T)
-Ŷ = Array(Ŷ)  # size (2, T)
-
-T = size(X̂, 2)
-inputs = [X̂[:, i] for i in 1:T]      # list of [u1, u2]
-targets = [Ŷ[:, i] for i in 1:T]     # list of [ŷ1, ŷ2]
-
-# =============================================================================
-#  CELL 18 — (Notebook scratch) first design-matrix attempt; superseded below
-# =============================================================================
-# 4. Build design matrix and solve for β₁ and β₂
-Φ = [f(u) for f in basis_funcs, u in inputs]'  # note the transpose
-
-# =============================================================================
-#  CELL 19 — Rebuild inputs/targets (kept for 1:1 correspondence with notebook)
-# =============================================================================
-T = size(X̂, 2)
-inputs = [X̂[:, i] for i in 1:T]      # list of [u1, u2]
-targets = [Ŷ[:, i] for i in 1:T]     # list of [ŷ1, ŷ2]
-
-# =============================================================================
-#  CELL 20 — Final design matrix Φ and regression targets y₁, y₂
-# =============================================================================
+# Design matrix Φ (rows = samples, cols = basis terms) and the two regression
+# targets (the components of the network output along the trajectory).
+X̂ = Array(X̂)
+Ŷ = Array(Ŷ)
+Nt = size(X̂, 2)
+inputs = [X̂[:, i] for i in 1:Nt]
+targets = [Ŷ[:, i] for i in 1:Nt]
 Φ = [Float64(f(u)) for u in inputs, f in basis_funcs]
-y₁ = reshape(Float64.([y[1] for y in targets]), :, 1)        # size (T × 1)
-y₂ = reshape(Float64.([y[2] for y in targets]), :, 1)        # size (T × 1)
+y₁ = reshape(Float64.([y[1] for y in targets]), :, 1)
+y₂ = reshape(Float64.([y[2] for y in targets]), :, 1)
 
-# =============================================================================
-#  CELL 21 — Sparse regression via LASSO
-# -----------------------------------------------------------------------------
-#  The notebook solved this with Convex.jl + SCS (preserved verbatim at the
-#  bottom of this cell). That works on Julia 1.10+, but on the pinned Julia 1.6.7
-#  bootcamp stack, loading Convex on top of the full SciML stack triggers a
-#  method-invalidation cascade that hangs for 30+ min. So we solve the IDENTICAL
-#  LASSO objective  ( min ‖Φβ − y‖₂² + λ‖β‖₁ )  with a small pure-Julia
-#  coordinate-descent solver. Verified against Convex/SCS on this exact problem:
-#  same sparsity pattern, coefficients agree to ~3e-3 (SCS's own tolerance), and
-#  after the threshold in CELL 22 the recovered equations are identical.
-# =============================================================================
-λ = 0.1  # Lasso regularization strength
-
-# Coordinate descent for  min ‖Φβ − y‖₂² + λ‖β‖₁  (soft-thresholding, γ = λ/2).
+# LASSO ( min ‖Φβ − y‖₂² + λ‖β‖₁ ) via coordinate descent with soft-thresholding.
+# The L1 penalty drives all but the genuinely-active basis terms to zero, so the
+# regression selects a sparse, interpretable equation.
+λ = 0.1
 function lasso_cd(Φ, y; λ = 0.1, iters = 50_000, tol = 1e-12)
     m = size(Φ, 2)
     β = zeros(m)
@@ -375,37 +290,19 @@ function lasso_cd(Φ, y; λ = 0.1, iters = 50_000, tol = 1e-12)
         end
         Δ < tol && break
     end
-    return reshape(β, :, 1)     # column vector, matching Convex's evaluate() shape
+    return reshape(β, :, 1)
 end
 
-β₁ = lasso_cd(Φ, vec(y₁); λ = λ)   # Solve Lasso for y₁
-β₂ = lasso_cd(Φ, vec(y₂); λ = λ)   # Solve Lasso for y₂
+β₁ = lasso_cd(Φ, vec(y₁); λ = λ)
+β₂ = lasso_cd(Φ, vec(y₂); λ = λ)
 
-# --- Original notebook method (Convex.jl + SCS) — use on Julia 1.10+ -----------
-# using Convex, SCS
-# β₁_var = Convex.Variable(size(Φ, 2), 1)
-# prob₁ = minimize(sumsquares(Φ * β₁_var - y₁) + λ * norm(β₁_var, 1))
-# Convex.solve!(prob₁, SCS.Optimizer)
-# β₁ = evaluate(β₁_var)
-# β₂_var = Convex.Variable(size(Φ, 2), 1)
-# prob₂ = minimize(sumsquares(Φ * β₂_var - y₂) + λ * norm(β₂_var, 1))
-# Convex.solve!(prob₂, SCS.Optimizer)
-# β₂ = evaluate(β₂_var)
-
-# =============================================================================
-#  CELL 22 — Threshold small coefficients & pretty-print the learned equations
-# =============================================================================
-using Printf
-# Step 5: Thresholding + pretty printing
-threshold = 0.1# adjust as needed
-
+# Threshold tiny coefficients and pretty-print the surviving terms.
+threshold = 0.1
 function format_expr(β, φs, threshold)
-    terms = []
+    terms = String[]
     for (coeff, term) in zip(β, φs)
         if abs(coeff) > threshold
-            coeff_str = @sprintf("%f", coeff)
-            term_str = string(term)
-            push!(terms, coeff_str * "*" * term_str)
+            push!(terms, @sprintf("%f", coeff) * "*" * string(term))
         end
     end
     return join(terms, " + ")
@@ -414,13 +311,11 @@ end
 expr₁_str = format_expr(β₁, basis_symbols, threshold)
 expr₂_str = format_expr(β₂, basis_symbols, threshold)
 
-println("📘 Learned symbolic expression for NN output 1 (thresholded):")
-println("y₁(t) ≈ ", expr₁_str)
+println("\nLearned symbolic expression for NN output 1 (thresholded):")
+println("  y₁(t) ≈ ", expr₁_str)
+println("Learned symbolic expression for NN output 2 (thresholded):")
+println("  y₂(t) ≈ ", expr₂_str)
 
-println("\n📘 Learned symbolic expression for NN output 2 (thresholded):")
-println("y₂(t) ≈ ", expr₂_str)
-
-# Persist the recovered equations and the full coefficient table.
 open(joinpath(RES_DIR, "learned_equations.txt"), "w") do io
     println(io, "Learned symbolic expression for NN output 1 (thresholded):")
     println(io, "y1(t) ~ ", expr₁_str)
@@ -436,53 +331,34 @@ open(joinpath(RES_DIR, "sindy_coefficients.csv"), "w") do io
 end
 
 # =============================================================================
-#  CELL 23 — Simulate the recovered mechanistic model vs. the true model
+#  7. Rebuild the mechanistic model from the recovered coefficients
 # =============================================================================
-function lotka_volterra!(du, u, p, t)
-    α, β, γ, δ = p
-    du[1] = α * u[1] - β * u[2] * u[1]
-    du[2] = γ * u[1] * u[2] - δ * u[2]
-end
+# The regression keeps only the u₁·u₂ term (index 7); its coefficient is the
+# interaction strength. Since the true terms are Ȳ₁ = -β·xy and Ȳ₂ = +γ·xy,
+# we read β = -β₁[7] and γ = β₂[7] straight from the recovered coefficients.
+β_recovered = -β₁[7]
+γ_recovered = β₂[7]
+println("\nRecovered interaction coefficients:")
+println("  β (prey loss)     ≈ ", β_recovered, "   (true 0.9)")
+println("  γ (predator gain) ≈ ", γ_recovered, "   (true 0.8)")
 
-# Initial conditions and time span
-tspan = (0.0, 5.0)  # correct for ODEProblem
-
-u0 = [3.1461493970111687,
- 1.5370475785612603]
-# Actual parameters
+u0 = [3.1461493970111687, 1.5370475785612603]
 params_actual = [1.3, 0.9, 0.8, 1.8]
+params_learned = [1.3, β_recovered, γ_recovered, 1.8]
 
-# Plug in your learned coefficients here (from symbolic regression).
-# The 2nd and 3rd entries are the interaction coefficients recovered by the
-# LASSO above (the u₁·u₂ term of β₁ and β₂); α and δ are the known parameters.
-params_learned = [1.3, 0.893595, 0.796093, 1.8]
+sol_actual = solve(ODEProblem(lotka!, u0, tspan, params_actual),
+    Tsit5(), abstol = 1e-12, reltol = 1e-12, saveat = 0.025)
+sol_learned = solve(ODEProblem(lotka!, u0, tspan, params_learned),
+    Tsit5(), abstol = 1e-12, reltol = 1e-12, saveat = 0.025)
 
-# Solve actual model
-prob_actual = ODEProblem(lotka_volterra!, u0, tspan, params_actual)
-sol_actual = solve(prob_actual, Tsit5(), abstol = 1e-12, reltol = 1e-12,saveat = 0.025)
-
-# Solve learned model
-prob_learned = ODEProblem(lotka_volterra!, u0, tspan, params_learned)
-sol_learned = solve(prob_learned, Tsit5(), abstol = 1e-12, reltol = 1e-12,saveat = 0.025)
-
-# For reference, report the freshly-recovered u₁·u₂ interaction coefficients
-# (index 7 of the basis). Ȳ[1] = -β·xy and Ȳ[2] = +γ·xy, so β ≈ -β₁[7], γ ≈ β₂[7].
-println("\nRecovered interaction coefficients this run:")
-println("  β (prey loss)      ≈ ", -β₁[7], "   (true 0.9)")
-println("  γ (predator gain)  ≈ ", β₂[7], "   (true 0.8)")
-
-# =============================================================================
-#  CELL 24 — Final comparison plot: actual vs. symbolic-regression model
-# =============================================================================
-# Plot comparison
-fig_compare = plot(sol_actual.t, sol_actual[1,:], label="Resource/Capital - Actual", lw=2)
-plot!(sol_actual.t, sol_actual[2,:], label="Companies/Agents - Actual", lw=2)
-plot!(sol_learned.t, sol_learned[1,:], label="Resource/Capital - Learned", ls=:dash, lw=2)
-plot!(sol_learned.t, sol_learned[2,:], label="Companies/Agents - Learned", ls=:dash, lw=2)
+fig_compare = plot(sol_actual.t, sol_actual[1, :], label = "Prey - Actual", lw = 2)
+plot!(sol_actual.t, sol_actual[2, :], label = "Predator - Actual", lw = 2)
+plot!(sol_learned.t, sol_learned[1, :], label = "Prey - Learned", ls = :dash, lw = 2)
+plot!(sol_learned.t, sol_learned[2, :], label = "Predator - Learned", ls = :dash, lw = 2)
 xlabel!("Time")
-ylabel!("Value")
-title!("Actual vs Symbolic Regression Model")
+ylabel!("Population")
+title!("Actual vs Recovered Lotka–Volterra Model")
 savefig(fig_compare, joinpath(FIG_DIR, "07_actual_vs_learned.png"))
 
-println("\n✅ Done. All figures saved to $(FIG_DIR)")
-println("✅ All numeric artefacts saved to $(RES_DIR)")
+println("\nDone. Figures saved to $(FIG_DIR)")
+println("Numeric artefacts saved to $(RES_DIR)")
