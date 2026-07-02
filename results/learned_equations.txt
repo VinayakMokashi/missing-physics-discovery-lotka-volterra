@@ -1,9 +1,5 @@
 Learned symbolic expression for NN output 1 (thresholded):
-y1(t) ~ -0.834285*u1*u2
+y1(t) ~ -0.834285*u₁*u₂
 
 Learned symbolic expression for NN output 2 (thresholded):
-y2(t) ~ 0.701158*u1*u2
-
-Recovered interaction coefficients (u1*u2 term):
-  beta (prey loss)     ~ 0.834285   (true 0.9)
-  gamma (predator gain)~ 0.701158   (true 0.8)
+y2(t) ~ 0.701158*u₁*u₂

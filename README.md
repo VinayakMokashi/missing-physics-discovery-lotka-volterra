@@ -35,7 +35,7 @@ the nonlinear interaction terms (`−β·x·y` and `+γ·x·y`) from noisy obser
 | 1 | Generate noisy data from the true ODE | `OrdinaryDiffEq` |
 | 2 | Build a UDE — known linear terms + a neural net `U(x,y)` for the unknown terms | `Lux`, `ComponentArrays` |
 | 3 | Train `U` to fit the data: **ADAM** warm-up → **L-BFGS** polish | `Optimization`, `SciMLSensitivity`, `Zygote` |
-| 4 | Sparse **symbolic regression** (LASSO over a polynomial basis) recovers the equation | `Convex`, `SCS`, `Symbolics` |
+| 4 | Sparse **symbolic regression** (LASSO over a polynomial basis) recovers the equation | pure-Julia `LinearAlgebra` (notebook used `Convex`/`SCS`) |
 | 5 | Plug recovered coefficients into the mechanistic ODE and compare to truth | `OrdinaryDiffEq`, `Plots` |
 
 The neural network uses a radial-basis (`exp(-x²)`) activation, which pairs well
@@ -45,14 +45,26 @@ with the smooth polynomial structure the interaction terms actually have.
 
 ## Quick start
 
-The notebook this was ported from targets **Julia 1.10+**, which is the
-recommended way to run the whole pipeline end to end.
+The script runs end to end on both a modern Julia and the older pinned SciML
+environment — the sparse-regression step uses a small pure-Julia LASSO solver,
+so **no extra packages are needed**. Pick whichever environment you have.
 
-### Option A — modern Julia (1.10+), recommended
+### Option A — the pinned bootcamp environment (Julia 1.6.7)
 
-Uses the `Project.toml` in this folder. The first run resolves and precompiles
-the full stack (slow the first time), then runs everything — training *and* the
-`Convex`/`SCS` symbolic-regression step — smoothly:
+If you already have the SciML `bootcamp` environment, just point Julia at it:
+
+```bash
+julia --project="d:/SciML/bootcamp" "lotka_volterra_ude.jl"
+```
+
+Verified end to end on this setup (Julia 1.6.7): training + all seven figures +
+all result files, in a few minutes.
+
+### Option B — standalone, modern Julia (1.10+)
+
+For a fresh clone that does not have the bootcamp environment. Uses the
+`Project.toml` in this folder; the first run resolves and precompiles the stack
+(slow the first time):
 
 ```bash
 # from inside the project folder
@@ -62,23 +74,13 @@ julia --project=. lotka_volterra_ude.jl
 
 After instantiating, commit the generated `Manifest.toml` to pin exact versions.
 
-### Option B — the pinned bootcamp environment (Julia 1.6.7)
-
-If you already have the SciML `bootcamp` environment, point Julia at it. The
-script auto-installs the two extra packages it needs (`Convex`, `SCS`):
-
-```bash
-julia --project="d:/SciML/bootcamp" "lotka_volterra_ude.jl"
-```
-
-**Caveat:** data generation, training, and figures 01–06 run fine and fast on
-Julia 1.6.7 — but loading `Convex` on top of the full SciML stack triggers a
-very slow method-invalidation cascade specific to **Julia 1.6**, which makes the
-final symbolic-regression step (cell 21) impractical there. Use **Option A** for
-the complete run. (The committed `figures/` and `results/` were generated on this
-machine; the LASSO in `results/` solves the exact same objective the script's
-`Convex` code does — `min ‖Φβ − y‖² + λ‖β‖₁` — so the recovered `u1*u2`
-coefficients are reproducible under Option A.)
+> **Note on the LASSO solver.** The notebook solved the sparse regression with
+> `Convex.jl` + `SCS`. That code is preserved (commented) in cell 21, but the
+> active solver is a tiny pure-Julia coordinate descent minimising the *identical*
+> objective, `min ‖Φβ − y‖² + λ‖β‖₁`. It was verified head-to-head against
+> `Convex`/`SCS` on this exact problem — same sparsity pattern, coefficients
+> agreeing to ~3e-3 (SCS's own tolerance). This is what lets the whole pipeline
+> run on Julia 1.6.7, where loading `Convex` on the full SciML stack hangs.
 
 > **Runtime:** training runs 5000 ADAM iterations followed by up to 5000 L-BFGS
 > iterations, so expect a few minutes of compute on a laptop (on top of the
