@@ -1,0 +1,25 @@
+# OS / editor junk
+.DS_Store
+Thumbs.db
+*~
+.vscode/
+.idea/
+
+# Claude Code tooling state (not part of the project)
+.claude/
+
+# Julia coverage / profiling artifacts
+*.jl.cov
+*.jl.*.cov
+*.jl.mem
+/docs/build/
+
+# Jupyter checkpoint clutter
+.ipynb_checkpoints/
+
+# NOTE: figures/ and results/ ARE tracked on purpose — they are the committed
+# visual + quantitative evidence produced by lotka_volterra_ude.jl.
+#
+# NOTE: Manifest.toml is intentionally NOT ignored. After you run
+#   julia --project=. -e 'using Pkg; Pkg.instantiate()'
+# commit the generated Manifest.toml to pin exact package versions.
